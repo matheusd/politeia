@@ -555,6 +555,12 @@ func (c *ctx) _voteTrickler(token, voteBit string, ctres *pb.CommittedTicketsRes
 	}
 }
 
+func orPanic(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
 func (c *ctx) _vote(token, voteId string) ([]string, *v1.BallotReply, error) {
 	// XXX This is expensive but we need the snapshot of the votes. Later
 	// replace this with a locally saved file in order to prevent sending
@@ -676,6 +682,27 @@ func (c *ctx) _vote(token, voteId string) ([]string, *v1.BallotReply, error) {
 		})
 		tickets = append(tickets, h.String())
 	}
+
+	if st, err := os.Stat("./votes"); os.IsNotExist(err) {
+		os.Mkdir("./votes", 0700)
+	} else if !st.IsDir() {
+		panic(errors.New("not a dir"))
+	}
+
+	for i, vote := range cv.Votes {
+		cvv := v1.Ballot{
+			Votes: []v1.CastVote{vote},
+		}
+		bts, err := json.Marshal(cvv)
+		orPanic(err)
+
+		f, err := os.Create(fmt.Sprintf("./votes/%s-%05d.vote", vote.Token[:7], i))
+		orPanic(err)
+		f.Write(bts)
+		f.Close()
+	}
+
+	orPanic(errors.New("quit"))
 
 	// Vote on the supplied proposal
 	responseBody, err := c.makeRequest("POST", v1.RouteCastVotes, &cv)
