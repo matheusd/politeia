@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -461,13 +463,66 @@ func batchTransactions(hashes []string) ([]dcrdataapi.TrimmedTx, error) {
 	return ttx, nil
 }
 
-// largestCommitmentResult returns the largest commitment address or an error.
-type largestCommitmentResult struct {
+type sortedAmounts []dcrutil.Amount
+
+func (a sortedAmounts) Len() int           { return len(a) }
+func (a sortedAmounts) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a sortedAmounts) Less(i, j int) bool { return a[i] < a[j] }
+
+func politeiaVoterIndex(randomHash *chainhash.Hash, amounts []dcrutil.Amount) (int, error) {
+
+	if len(amounts) == 0 {
+		return 0, fmt.Errorf("not enough amounts")
+	}
+
+	if len(amounts) <= 2 {
+		var bestAmount dcrutil.Amount
+		var bestIndex int
+		for i, amt := range amounts {
+			if amt > bestAmount {
+				bestAmount = amt
+				bestIndex = i
+			}
+		}
+		return bestIndex, nil
+	}
+
+	sort.Sort(sortedAmounts(amounts))
+
+	// ignore the first one (smallest amount/pool fee)
+	var amountsSum dcrutil.Amount
+	for _, a := range amounts[1:] {
+		amountsSum += a
+	}
+
+	coinBig := big.NewInt(0)
+	n := big.NewInt(0)
+	n.SetBytes(randomHash[:])
+	m := big.NewInt(int64(amountsSum))
+	coinBig.Mod(n, m)
+
+	coin := coinBig.Uint64()
+
+	amountsSum = 0
+	var bestIndex int
+	for i, c := range amounts {
+		amountsSum += c
+		if coin < uint64(amountsSum) {
+			bestIndex = i
+			break
+		}
+	}
+
+	return bestIndex, nil
+}
+
+// weighedCommitmentResult returns the largest commitment address or an error.
+type weightedCommitmentResult struct {
 	bestAddr string
 	err      error
 }
 
-func largestCommitmentAddresses(hashes []string) ([]largestCommitmentResult, error) {
+func weightedCommitmentAddresses(hashes []string) ([]weightedCommitmentResult, error) {
 	// Batch request all of the transaction info from dcrdata.
 	ttxs, err := batchTransactions(hashes)
 	if err != nil {
@@ -475,33 +530,57 @@ func largestCommitmentAddresses(hashes []string) ([]largestCommitmentResult, err
 	}
 
 	// Find largest commitment address for each transaction.
-	r := make([]largestCommitmentResult, len(hashes))
+	r := make([]weightedCommitmentResult, len(hashes))
 	for i := range ttxs {
-		// Best is address with largest commit amount.
-		var bestAddr string
-		var bestAmount float64
+		tx := &ttxs[i]
+
+		amounts := make([]dcrutil.Amount, 0, (len(tx.Vout)-1)/2)
+		commitAddresses := make([]dcrutil.Address, 0, (len(tx.Vout)-1)/2)
+
 		for _, v := range ttxs[i].Vout {
 			if v.ScriptPubKeyDecoded.CommitAmt == nil {
 				continue
 			}
-			if *v.ScriptPubKeyDecoded.CommitAmt > bestAmount {
-				if len(v.ScriptPubKeyDecoded.Addresses) == 0 {
-					// jrick, does this need to be printed?
-					log.Errorf("unexpected addresses "+
-						"length: %v", ttxs[i].TxID)
-					continue
-				}
-				bestAddr = v.ScriptPubKeyDecoded.Addresses[0]
-				bestAmount = *v.ScriptPubKeyDecoded.CommitAmt
+			amt, err := dcrutil.NewAmount(*v.ScriptPubKeyDecoded.CommitAmt)
+			if err != nil {
+				return nil, err
 			}
+
+			if len(v.ScriptPubKeyDecoded.Addresses) == 0 {
+				// jrick, does this need to be printed?
+				log.Errorf("unexpected addresses "+
+					"length: %v", ttxs[i].TxID)
+				continue
+			}
+
+			addr, err := dcrutil.DecodeAddress(v.ScriptPubKeyDecoded.Addresses[0])
+			if err != nil {
+				log.Errorf("error decoding address: %v", err)
+				continue
+			}
+
+			amounts = append(amounts, amt)
+			commitAddresses = append(commitAddresses, addr)
 		}
 
-		if bestAddr == "" || bestAmount == 0.0 {
+		if len(amounts) == 0 {
 			r[i].err = fmt.Errorf("no best commitment address found: %v",
 				ttxs[i].TxID)
 			continue
 		}
-		r[i].bestAddr = bestAddr
+
+		var txh chainhash.Hash
+		err = chainhash.Decode(&txh, tx.TxID)
+		if err != nil {
+			return nil, err
+		}
+
+		bestIdx, err := politeiaVoterIndex(&txh, amounts)
+		if err != nil {
+			return nil, err
+		}
+
+		r[i].bestAddr = commitAddresses[bestIdx].EncodeAddress()
 	}
 
 	return r, nil
@@ -2054,7 +2133,7 @@ func (g *gitBackEnd) pluginBallot(payload string) (string, error) {
 	for _, v := range ballot.Votes {
 		tickets = append(tickets, v.Ticket)
 	}
-	ticketAddresses, err := largestCommitmentAddresses(tickets)
+	ticketAddresses, err := weightedCommitmentAddresses(tickets)
 	if err != nil {
 		return "", err
 	}
